@@ -6,7 +6,9 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import gradio as gr
 
-# ---------------- Constants ----------------
+# -----------------------------
+# Constants / helpers
+# -----------------------------
 SUFFIXES = {
     "ltd","limited","co","company","corp","corporation","inc","incorporated",
     "plc","public","llc","lp","llp","ulc","pc","pllc","sa","ag","nv","se","bv",
@@ -30,7 +32,6 @@ COUNTRY_EQUIVALENTS = {
 
 THRESHOLD = 70
 
-# ---------------- Helpers ----------------
 def _normalize_tokens(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -61,21 +62,25 @@ def compare_company_domain(company: str, domain: str):
         return "Unsure – Please Check", 0, "missing input"
 
     c = _normalize_tokens(company)
-    d = _clean_domain(domain)
+    d_raw = domain.lower().strip()
+    d = _clean_domain(d_raw)
 
-    # direct containment (spaces removed)
-    c_compact = c.replace(" ", "")
-    d_compact = d.replace(" ", "")
-    if d_compact and (d_compact in c_compact or c_compact in d_compact):
+    # direct containment on compacted tokens
+    if d in c.replace(" ", "") or c.replace(" ", "") in d:
         return "Likely Match", 100, "direct containment"
 
-    # token containment + partial fuzzy
-    if any(word in c for word in d.split()) or any(word in d for word in c.split()):
+    # token containment + partial
+    if any(w in c for w in d.split()) or any(w in d for w in c.split()):
         score = fuzz.partial_ratio(c, d)
         if score >= 70:
             return "Likely Match", score, "token containment"
 
-    # full/partial fuzzy
+    # generic brand-ish terms to avoid over-penalising pharma/health etc.
+    BRAND_TERMS = {"tx","bio","pharma","therapeutics","labs","health","med","rx"}
+    if any(t in c.split() for t in BRAND_TERMS) and any(t in d for t in BRAND_TERMS):
+        if fuzz.partial_ratio(c, d) >= 70:
+            return "Likely Match", 90, "brand suffix match"
+
     score_full = fuzz.token_sort_ratio(c, d)
     score_partial = fuzz.partial_ratio(c, d)
     score = max(score_full, score_partial)
@@ -87,7 +92,19 @@ def compare_company_domain(company: str, domain: str):
     else:
         return "Likely NOT Match", score, "low similarity"
 
-def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr.Progress(track_tqdm=True)):
+# -----------------------------
+# Main function for Gradio
+# -----------------------------
+def run_matching(master_file, picklist_file, highlight_changes=True):
+    # create progress INSIDE the function (not in signature!)
+    progress = gr.Progress(track_tqdm=True)
+
+    def _write_error_file(msg: str) -> str:
+        path = "error.txt"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(msg)
+        return path
+
     try:
         progress(0, desc="📂 Reading uploaded files...")
         df_master = pd.read_excel(master_file.name)
@@ -108,7 +125,8 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
         for master_col, picklist_col in EXACT_PAIRS:
             out_col = f"Match_{master_col}"
             if master_col in df_master.columns and picklist_col in df_picklist.columns:
-                pick_map = {v.strip().lower(): v.strip() for v in df_picklist[picklist_col].dropna().astype(str)}
+                pick_map = {v.strip().lower(): v.strip()
+                            for v in df_picklist[picklist_col].dropna().astype(str)}
                 matches, new_vals = [], []
                 for i, val in enumerate(df_master[master_col].fillna("").astype(str)):
                     val_norm = val.strip().lower()
@@ -127,7 +145,7 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
             else:
                 df_out[out_col] = "Column Missing"
 
-        # dynamic Q columns
+        # Dynamic Question columns
         q_cols = [c for c in df_picklist.columns if re.match(r"(?i)q0*\d+|question\s*\d+", c)]
         for qc in q_cols:
             out_col = f"Match_{qc}"
@@ -135,10 +153,10 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
                 valid_answers = set(df_picklist[qc].dropna().astype(str).str.strip().str.lower())
                 matches = []
                 for val in df_master[qc].fillna("").astype(str):
-                    val_norm = val.strip().lower()
-                    if val_norm in valid_answers:
+                    vv = val.strip().lower()
+                    if vv in valid_answers:
                         matches.append("Yes")
-                    elif val_norm == "":
+                    elif vv == "":
                         matches.append("Blank")
                     else:
                         matches.append("No")
@@ -146,7 +164,7 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
             else:
                 df_out[out_col] = "Column Missing"
 
-        # seniority parsing
+        # Seniority parsing
         def parse_seniority(title):
             if not isinstance(title, str): return "Entry", "no title"
             t = title.lower().strip()
@@ -167,7 +185,7 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
             df_out["Parsed_Seniority"] = None
             df_out["Seniority_Logic"] = "jobtitle column not found"
 
-        # domain vs company
+        # Domain vs Company
         progress(0.6, desc="🌐 Validating company ↔ domain...")
         company_cols = [c for c in df_master.columns if c.strip().lower() in ["companyname","company","company name","company_name"]]
         domain_cols = [c for c in df_master.columns if c.strip().lower() in ["website","domain","email domain","email_domain"]]
@@ -187,9 +205,7 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
                 elif email_col and pd.notna(df_master.at[i, email_col]):
                     dom = _extract_domain_from_email(df_master.at[i, email_col])
                 status, score, reason = compare_company_domain(comp, dom)
-                statuses.append(status)
-                scores.append(score)
-                reasons.append(reason)
+                statuses.append(status); scores.append(score); reasons.append(reason)
 
             df_out["Domain_Check_Status"] = statuses
             df_out["Domain_Check_Score"] = scores
@@ -199,54 +215,64 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
             df_out["Domain_Check_Score"] = None
             df_out["Domain_Check_Reason"] = None
 
-        # save + formatting
+        # Save + formatting
         progress(0.9, desc="💾 Saving results...")
         out_file = f"{os.path.splitext(master_file.name)[0]} - Full_Check_Results.xlsx"
         df_out.to_excel(out_file, index=False)
-        wb = load_workbook(out_file)
-        ws = wb.active
-        yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-        green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-        red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-        blue = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
 
-        for col_idx, col in enumerate(df_out.columns, start=1):
-            if col.startswith("Match_"):
-                for row in range(2, ws.max_row + 1):
-                    val = str(ws.cell(row=row, column=col_idx).value).strip().lower()
-                    if val == "yes":
-                        ws.cell(row=row, column=col_idx).fill = green
-                    elif val == "no":
-                        ws.cell(row=row, column=col_idx).fill = red
-                    else:
-                        ws.cell(row=row, column=col_idx).fill = yellow
+        try:
+            wb = load_workbook(out_file)
+            ws = wb.active
+            yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+            green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            blue = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
 
-        if highlight_changes:
-            for col_name, row in corrected_cells:
-                if col_name in df_out.columns:
-                    col_idx = list(df_out.columns).index(col_name) + 1
-                    ws.cell(row=row, column=col_idx).fill = blue
+            for col_idx, col in enumerate(df_out.columns, start=1):
+                if col.startswith("Match_"):
+                    for row in range(2, ws.max_row + 1):
+                        val = str(ws.cell(row=row, column=col_idx).value).strip().lower()
+                        if val == "yes":
+                            ws.cell(row=row, column=col_idx).fill = green
+                        elif val == "no":
+                            ws.cell(row=row, column=col_idx).fill = red
+                        else:
+                            ws.cell(row=row, column=col_idx).fill = yellow
 
-        wb.save(out_file)
+            if highlight_changes:
+                for col_name, row in corrected_cells:
+                    if col_name in df_out.columns:
+                        col_idx = list(df_out.columns).index(col_name) + 1
+                        ws.cell(row=row, column=col_idx).fill = blue
+
+            wb.save(out_file)
+        except Exception:
+            # formatting is best-effort; don’t fail the whole job
+            pass
+
         progress(1.0, desc="✅ Done! File ready for download.")
         return out_file
 
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return _write_error_file(f"❌ Error: {str(e)}")
 
-# ---------------- UI ----------------
+# -----------------------------
+# UI
+# -----------------------------
 demo = gr.Interface(
     fn=run_matching,
     inputs=[
         gr.File(label="Upload MASTER Excel file (.xlsx)"),
         gr.File(label="Upload PICKLIST Excel file (.xlsx)"),
-        gr.Checkbox(label="Highlight changed values (blue)", value=True)
+        gr.Checkbox(label="Highlight changed values (blue)", value=True),
     ],
     outputs=gr.File(label="Download Processed File"),
     title="📊 Master–Picklist + Domain Matching Tool",
-    description="Upload MASTER & PICKLIST Excel files to auto-match, validate domains, map questions, and optionally highlight changed values."
+    description="Upload MASTER & PICKLIST Excel files to auto-match, validate domains, map questions, and optionally highlight changed values.",
 )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    # queue without deprecated args; avoid API schema headaches
+    demo.queue(max_size=16)
+    demo.launch(server_name="0.0.0.0", server_port=port, max_threads=40, show_api=False)
